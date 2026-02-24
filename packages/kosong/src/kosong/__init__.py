@@ -130,9 +130,10 @@ async def step(
         asyncio.CancelledError: If the step is cancelled.
     """
 
-    tool_calls: list[ToolCall] = []
-    tool_result_futures: dict[str, ToolResultFuture] = {}
+    tool_calls: list[ToolCall] = []   ### zjx：收集 LLM 返回的所有工具调用请求
+    tool_result_futures: dict[str, ToolResultFuture] = {}  ### zjx： 每个工具调用的异步执行结果（Future）
 
+    ### zjx：当某个工具执行完成时，自动触发这个回调。
     def future_done_callback(future: ToolResultFuture):
         if on_tool_result:
             try:
@@ -141,16 +142,45 @@ async def step(
             except asyncio.CancelledError:
                 return
 
+    ### zjx：重点！！！这是一个回调函数，当 LLM 流式输出中解析到一个工具调用时被触发
     async def on_tool_call(tool_call: ToolCall):
+        ### zjx：先记录工具调用到列表中。
         tool_calls.append(tool_call)
+        ### zjx：交给工具集处理。
         result = toolset.handle(tool_call)
 
+
+        """
+        ====================================================
+        # Commentator: zjx
+        
+                        toolset.handle()
+                          /         \
+                 同步结果            异步 Future
+                ToolResult        ToolResultFuture
+                    |                    |
+                    ▼                    │
+            包装成 Future               直接用
+            立刻 set_result               │
+                    |                    │
+                    ▼                    ▼
+                ┌──────────────────────────┐
+                │   tool_result_futures    │  ← 统一是 dict[str, Future]
+                │   全部是 Future 接口       │
+                └──────────────────────────┘
+                            │
+                            ▼
+                  await result.tool_results()  ← 上层代码不需要区分
+        ====================================================
+        """
         if isinstance(result, ToolResult):
+            ### zjx：情况 A：工具同步完成（工具立即返回了结果）
             future = ToolResultFuture()
             future.add_done_callback(future_done_callback)
             future.set_result(result)
             tool_result_futures[tool_call.id] = future
         else:
+            ### zjx：情况 B：异步执行（工具还在后台运行）
             result.add_done_callback(future_done_callback)
             tool_result_futures[tool_call.id] = result
 
@@ -171,12 +201,31 @@ async def step(
         await asyncio.gather(*tool_result_futures.values(), return_exceptions=True)
         raise
 
+    """
+    ====================================================
+    # Commentator: zjx
+    
+    StepResult 结构：
+    {
+        id: "msg_abc123",
+        message: Message(role="assistant", content=[
+            TextPart("让我来读取这个文件"),  //大模型的回答
+            ToolCallPart(id="tc_1", name="read_file", args={"path":"a.txt"}) //本次回答中有涉及到工具调用 
+        ]),
+        usage: Usage(input=1500, output=200),
+        tool_calls: [ToolCall(id="tc_1", ...)],
+        tool_result_futures: {
+            "tc_1": Future<ToolResult("file content...")>
+        }
+    }
+    ====================================================
+    """
     return StepResult(
-        result.id,
-        result.message,
-        result.usage,
-        tool_calls,
-        tool_result_futures,
+        result.id,  # LLM 消息的唯一 ID
+        result.message, # LLM 生成的完整消息（含文本和工具调用）
+        result.usage, # Token 用量统计
+        tool_calls, # 本步骤的所有工具调用列表
+        tool_result_futures, # 工具执行结果的 Future 字典
     )
 
 
