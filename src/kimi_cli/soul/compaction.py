@@ -41,7 +41,7 @@ if TYPE_CHECKING:
 
 class SimpleCompaction:
     def __init__(self, max_preserved_messages: int = 2) -> None:
-        self.max_preserved_messages = max_preserved_messages
+        self.max_preserved_messages = max_preserved_messages ### zjx：保留最近几条消息不被压缩（默认 2 条）
 
     async def compact(self, messages: Sequence[Message], llm: LLM) -> Sequence[Message]:
         compact_message, to_preserve = self.prepare(messages)
@@ -50,6 +50,7 @@ class SimpleCompaction:
 
         # Call kosong.step to get the compacted context
         # TODO: set max completion tokens
+        ### zjx：调用 LLM 进行压缩
         logger.debug("Compacting context...")
         result = await kosong.step(
             chat_provider=llm.chat_provider,
@@ -57,29 +58,50 @@ class SimpleCompaction:
             toolset=EmptyToolset(),
             history=[compact_message],
         )
+        ### zjx：记录压缩操作本身消耗的 token
         if result.usage:
             logger.debug(
                 "Compaction used {input} input tokens and {output} output tokens",
                 input=result.usage.input,
                 output=result.usage.output,
             )
-
+        ### zjx：创建一条特殊的消息，开头带一个 system 标记，告诉 Agent：之前的上下文已被压缩，以下是压缩后的内容
         content: list[ContentPart] = [
             system("Previous context has been compacted. Here is the compaction output:")
         ]
         compacted_msg = result.message
 
         # drop thinking parts if any
+        ### zjx：过滤思考过程
         content.extend(part for part in compacted_msg.content if not isinstance(part, ThinkPart))
         compacted_messages: list[Message] = [Message(role="user", content=content)]
         compacted_messages.extend(to_preserve)
+        """
+        ====================================================
+        # Commentator: zjx
+        [
+            Message(role="user", content=[
+                SystemPart("Previous context has been compacted..."),
+                TextPart("摘要：用户最初请求帮助修复项目中的 lint 错误。
+                          Agent 运行了 eslint，发现 5 个错误。
+                          已修复了 a.js 和 b.js 中的 3 个错误。
+                          用户随后要求也修复 TypeScript 错误..."),
+            ]),
+            
+            Message(role="assistant", content=[...]),    ← 保留的最近消息
+            Message(role="user", content=[...]),          ← 保留的最近消息
+        ]
+        ====================================================
+        """
         return compacted_messages
+
 
     class PrepareResult(NamedTuple):
         compact_message: Message | None
         to_preserve: Sequence[Message]
 
     def prepare(self, messages: Sequence[Message]) -> PrepareResult:
+        ### zjx：准备压缩的消息
         if not messages or self.max_preserved_messages <= 0:
             return self.PrepareResult(compact_message=None, to_preserve=messages)
 

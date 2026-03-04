@@ -252,9 +252,11 @@ class KimiSoul:
         return await self._agent_loop()
 
     def _build_slash_commands(self) -> list[SlashCommand[Any]]:
+        ### zjx：一个全局注册表，存放所有内置斜杠命令
         commands: list[SlashCommand[Any]] = list(soul_slash_registry.list_commands())
         seen_names = {cmd.name for cmd in commands}
 
+        ### zjx：注册 Skill 斜杠命令
         for skill in self._runtime.skills.values():
             if skill.type not in ("standard", "flow"):
                 continue
@@ -275,6 +277,7 @@ class KimiSoul:
             )
             seen_names.add(name)
 
+        ### zjx：注册 Flow 专属命令
         for skill in self._runtime.skills.values():
             if skill.type != "flow":
                 continue
@@ -739,6 +742,7 @@ class BackToTheFuture(Exception):
 
 
 class FlowRunner:
+
     def __init__(
         self,
         flow: Flow,
@@ -755,19 +759,33 @@ class FlowRunner:
         user_message: Message,
         max_ralph_iterations: int,
     ) -> FlowRunner:
+        """
+        ====================================================
+        # Commentator: zjx
+        构建一个简单的ReAct图
+        ====================================================
+        """
+        ### zjx：提取用户纯文本消息
         prompt_content = list(user_message.content)
         prompt_text = Message(role="user", content=prompt_content).extract_text(" ").strip()
+
+        ### zjx：计算总运行次数
         total_runs = max_ralph_iterations + 1
         if max_ralph_iterations < 0:
             total_runs = 1000000000000000  # effectively infinite
 
+        ### zjx：创建节点
+        ### zjx：初始化两个特殊节点：起点 和 终点。
         nodes: dict[str, FlowNode] = {
             "BEGIN": FlowNode(id="BEGIN", label="BEGIN", kind="begin"),
             "END": FlowNode(id="END", label="END", kind="end"),
         }
         outgoing: dict[str, list[FlowEdge]] = {"BEGIN": [], "END": []}
 
+        ### zjx：R1 节点：任务节点，label 就是用户的原始消息内容。
+        ### zjx：kind="task"：这是一个需要 Agent 执行的任务。
         nodes["R1"] = FlowNode(id="R1", label=prompt_content, kind="task")
+        ### zjx：R2 节点：决策节点，Agent 需要判断任务是否完成。
         nodes["R2"] = FlowNode(
             id="R2",
             label=(
@@ -781,6 +799,25 @@ class FlowRunner:
         outgoing["R1"] = []
         outgoing["R2"] = []
 
+        """
+        ====================================================
+        # Commentator: zjx
+        连接边
+        ┌───────┐         ┌──────────────┐         ┌──────────────────┐
+        │ BEGIN │────────►│     R1       │────────►│       R2         │
+        │       │         │   (task)     │         │   (decision)     │
+        │ 起点   │         │  执行用户任务  │         │  任务完成了吗？    │
+        └───────┘         └──────────────┘         └────┬─────────┬───┘
+                                                        │         │
+                                                  CONTINUE       STOP
+                                                        │         │
+                                                        ▼         ▼
+                                                   ┌────────┐  ┌──────┐
+                                                   │  R2    │  │ END  │
+                                                   │ (自循环)│  │ 终点  │
+                                                   └────────┘  └──────┘
+        ====================================================
+        """
         outgoing["BEGIN"].append(FlowEdge(src="BEGIN", dst="R1", label=None))
         outgoing["R1"].append(FlowEdge(src="R1", dst="R2", label=None))
         outgoing["R2"].append(FlowEdge(src="R2", dst="R2", label="CONTINUE"))
@@ -797,8 +834,16 @@ class FlowRunner:
             return
 
         current_id = self._flow.begin_id
-        moves = 0
-        total_steps = 0
+        """
+        ====================================================
+        # Commentator: zjx
+        一个 move 可能包含多个 steps：
+          move 1 (R1 节点): Agent 用了 5 个 step 来完成任务
+          move 2 (R2 节点): Agent 用了 2 个 step 来判断
+        ====================================================
+        """
+        moves = 0   ### zjx：流程图中走了几步（节点到节点）
+        total_steps = 0  ### zjx：总共执行了多少个 LLM step
         while True:
             node = self._flow.nodes[current_id]
             edges = self._flow.outgoing.get(current_id, [])
@@ -829,9 +874,48 @@ class FlowRunner:
     async def _execute_flow_node(
         self,
         soul: KimiSoul,
-        node: FlowNode,
-        edges: list[FlowEdge],
+        node: FlowNode, # 当前要执行的节点
+        edges: list[FlowEdge], # 该节点的所有出边
     ) -> tuple[str | None, int]:
+        """
+        ====================================================
+        # Commentator: zjx
+
+        _execute_flow_node(node, edges)
+            │
+            ▼
+        有出边？──No──► return (None, 0) 终止
+            │
+           Yes
+            │
+            ▼
+        构建 prompt
+            │
+            ▼
+      ┌─► while True
+      │     │
+      │     ▼
+      │   _flow_turn(prompt) → result
+      │     │
+      │     ├── tool_rejected? ──Yes──► return (None, steps) 终止
+      │     │
+      │     ├── 非 decision 节点? ──Yes──► return (edges[0].dst, steps) ✓
+      │     │
+      │     ▼  (是 decision 节点)
+      │   parse_choice(回复) → choice
+      │     │
+      │     ▼
+      │   match_flow_edge(choice) → next_id
+      │     │
+      │     ├── 匹配成功? ──Yes──► return (next_id, steps) ✓
+      │     │
+      │     └── 匹配失败? ──Yes──► 修改 prompt 追加纠错 ──┐
+      │                                                    │
+      └────────────────────────────────────────────────────┘
+                          (重试循环)
+        ====================================================
+        """
+        ### zjx：无出边检查
         if not edges:
             logger.error(
                 'Agent flow node "{node_id}" has no outgoing edges; stopping.',
@@ -839,11 +923,12 @@ class FlowRunner:
             )
             return None, 0
 
-        base_prompt = self._build_flow_prompt(node, edges)
-        prompt = base_prompt
+        ### zjx：构建提示词并进入执行循环
+        base_prompt = self._build_flow_prompt(node, edges) #根据节点内容和出边构建提示词
+        prompt = base_prompt #实际发送给 Agent 的提示词
         steps_used = 0
         while True:
-            result = await self._flow_turn(soul, prompt)
+            result = await self._flow_turn(soul, prompt) #让 Agent 执行一整轮对话
             steps_used += result.step_count
             if result.stop_reason == "tool_rejected":
                 logger.error("Agent flow stopped after tool rejection.")

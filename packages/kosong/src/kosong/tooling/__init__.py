@@ -229,6 +229,8 @@ class _GenerateJsonSchemaNoTitles(GenerateJsonSchema):
         json_schema.pop("title", None)
 
 
+### zjx：泛型参数 Params，约束为 BaseModel 的子类
+### zjx：为什么用泛型？ 让每个工具能定义自己的参数类型，同时享受类型检查
 class CallableTool2[Params: BaseModel](ABC):
     """
     The abstract base class of tools that can be called as callables, with typed parameters.
@@ -250,8 +252,10 @@ class CallableTool2[Params: BaseModel](ABC):
         description: str | None = None,
         params: type[Params] | None = None,
     ) -> None:
+        ### zjx：获取实际的子类
         cls = self.__class__
 
+        ### zjx：拿到工具的名字
         self.name = name or getattr(cls, "name", "")
         if not self.name:
             raise ValueError(
@@ -260,6 +264,7 @@ class CallableTool2[Params: BaseModel](ABC):
         if not isinstance(self.name, str):  # type: ignore[reportUnnecessaryIsInstance]
             raise ValueError("Tool name must be a string")
 
+        ### zjx：拿到工具的描述
         self.description = description or getattr(cls, "description", "")
         if not self.description:
             raise ValueError(
@@ -268,6 +273,7 @@ class CallableTool2[Params: BaseModel](ABC):
         if not isinstance(self.description, str):  # type: ignore[reportUnnecessaryIsInstance]
             raise ValueError("Tool description must be a string")
 
+        ### zjx：拿到工具的参数
         self.params = params or getattr(cls, "params", None)  # type: ignore
         if not self.params:
             raise ValueError(
@@ -276,10 +282,11 @@ class CallableTool2[Params: BaseModel](ABC):
         if not isinstance(self.params, type) or not issubclass(self.params, BaseModel):  # type: ignore[reportUnnecessaryIsInstance]
             raise ValueError("Tool params must be a subclass of pydantic.BaseModel")
 
+        ### zjx：构建底层 Tool 定义
         self._base = Tool(
             name=self.name,
             description=self.description,
-            parameters=deref_json_schema(
+            parameters=deref_json_schema(  ### zjx：把参数变成json schema，方便发给模型
                 self.params.model_json_schema(schema_generator=_GenerateJsonSchemaNoTitles)
             ),
         )
@@ -292,11 +299,13 @@ class CallableTool2[Params: BaseModel](ABC):
     async def call(self, arguments: JsonType) -> ToolReturnValue:
         from kosong.tooling.error import ToolValidateError
 
+        ### zjx：Step 1: Pydantic 验证
         try:
             params = self.params.model_validate(arguments)
         except pydantic.ValidationError as e:
             return ToolValidateError(str(e))
 
+        ### zjx：Step 2: 调用实际实现
         ret = await self.__call__(params)
         if not isinstance(ret, ToolReturnValue):  # type: ignore[reportUnnecessaryIsInstance]
             # let's do not trust the return type of the tool
